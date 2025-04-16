@@ -390,7 +390,6 @@ impl Worker {
     /// Estabilish a connection with the queue server and send it the ID of this worker.
     pub fn connect(&mut self) -> io::Result<&mut Self> {
         self.server.connect()?;
-        self.set_client_id()?;
         Ok(self)
     }
 }
