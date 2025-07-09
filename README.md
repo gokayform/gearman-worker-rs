@@ -88,3 +88,66 @@ dual licensed as above, without any additional terms or conditions.
 [Gearman]: http://gearman.org/
 [link-author]: https://github.com/mtorromeo
 [link-contributors]: https://github.com/mtorromeo/gearman-worker-rs/graphs/contributors
+
+## Testing with Container
+
+This project includes a test script that automatically sets up a Gearman server in a Podman container and runs the test suite against it.
+
+### Prerequisites
+
+- [Podman](https://podman.io/getting-started/installation) installed and running
+- `gearman` command-line client available in the container (automatically installed)
+
+### Running Tests
+
+```bash
+# Run all tests with container setup
+./test-container.sh
+
+# Clean up test container
+./test-container.sh cleanup
+
+# View container logs
+./test-container.sh logs
+
+# Open shell in container for debugging
+./test-container.sh shell
+
+# Show help
+./test-container.sh help
+```
+
+### How it Works
+
+1. **Container Setup**: Creates a Podman container with Alpine Linux and installs Gearman server
+2. **Server Start**: Starts `gearmand` on port 4730 inside the container
+3. **Port Mapping**: Maps container port 4730 to host port 4730
+4. **Test Execution**: Runs `cargo test` with the container server
+5. **Cleanup**: Automatically removes the container when done
+
+### Test Structure
+
+The test suite includes:
+- **Basic job processing**: Tests normal job submission and processing
+- **Error handling**: Tests job failure scenarios
+- **Multiple jobs**: Tests processing multiple jobs sequentially
+
+### Manual Testing
+
+You can also test manually by running the container and connecting to it:
+
+```bash
+# Start container
+./test-container.sh
+
+# In another terminal, submit a job manually
+echo "test data" | gearman -f testfun
+
+# Or use the Rust library in your own code
+```
+
+### Troubleshooting
+
+- **Container fails to start**: Check that Podman is running and you have sufficient permissions
+- **Tests timeout**: The server might take longer to start; check logs with `./test-container.sh logs`
+- **Port conflicts**: Ensure port 4730 is not already in use on your host system

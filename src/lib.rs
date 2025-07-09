@@ -33,6 +33,9 @@ use std::io::prelude::*;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
 use std::process;
 use uuid::Uuid;
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use std::thread;
+use std::time::Duration;
 
 const CAN_DO: u32 = 1;
 const CANT_DO: u32 = 2;
@@ -55,6 +58,7 @@ const WORK_EXCEPTION: u32 = 25;
 // const JOB_ASSIGN_UNIQ: u32 = 31;
 // const GRAB_JOB_ALL: u32 = 39;
 // const JOB_ASSIGN_ALL: u32 = 40;
+const ERROR: u32 = 19;
 
 /// A packet received from the gearman queue server.
 struct Packet {
@@ -197,6 +201,7 @@ pub struct Worker {
     id: String,
     server: ServerConnection,
     functions: HashMap<String, CallbackInfo>,
+    should_shutdown: Arc<AtomicBool>,
 }
 
 /// Helps building a new [`Worker`](struct.Worker.html)
@@ -294,6 +299,9 @@ impl Worker {
                 self.server.send(CANT_DO, &name.as_bytes())?;
             }
         }
+        if self.functions.is_empty() {
+            eprintln!("[gearman-worker] Warning: No functions registered. Worker will not receive jobs.");
+        }
         Ok(())
     }
 
@@ -316,6 +324,9 @@ impl Worker {
                 if enabled { "enabled" } else { "disabled" }
             ),
             None => eprintln!("Unknown function {}", name),
+        }
+        if self.functions.is_empty() {
+            eprintln!("[gearman-worker] Warning: No functions registered. Worker will not receive jobs.");
         }
         Ok(())
     }
@@ -346,13 +357,20 @@ impl Worker {
         match resp.cmd {
             n if n == JOB_ASSIGN => Ok(Some(Job::from_data(&resp.data[..])?)),
             n if n == NO_JOB => Ok(None),
-            n => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "Either JOB_ASSIGN or NO_JOB was expected but packet {} was received instead.",
-                    n
-                ),
-            )),
+            n if n == ERROR => {
+                // Parse error message from packet data
+                let mut parts = resp.data.split(|c| *c == 0);
+                let code = parts.next().map(|s| String::from_utf8_lossy(s).to_string()).unwrap_or_else(|| "<unknown>".to_string());
+                let msg = parts.next().map(|s| String::from_utf8_lossy(s).to_string()).unwrap_or_else(|| "<no message>".to_string());
+                eprintln!("[gearman-worker] Server sent ERROR packet: code='{}', message='{}'", code, msg);
+                // Optionally, try to recover or reconnect here
+                // For now, just return no job
+                Ok(None)
+            },
+            n => {
+                eprintln!("[gearman-worker] Unexpected packet {} received in grab_job. Data: {:?}", n, resp.data);
+                Ok(None)
+            }
         }
     }
 
@@ -377,12 +395,76 @@ impl Worker {
     }
 
     /// Process any available job as soon as the gearman queue server provides us with one
-    /// in a loop.
+    /// in a loop, with reconnection, backoff, and graceful shutdown.
     pub fn run(&mut self) -> io::Result<()> {
+        if self.functions.is_empty() {
+            eprintln!("[gearman-worker] Warning: No functions registered before run(). Worker will not receive jobs.");
+        }
+
+        // Setup signal handler for graceful shutdown
+        let shutdown_flag = self.should_shutdown.clone();
+        {
+            let shutdown_flag = shutdown_flag.clone();
+            ctrlc::set_handler(move || {
+                eprintln!("[gearman-worker] Received shutdown signal. Exiting loop soon...");
+                shutdown_flag.store(true, Ordering::SeqCst);
+            }).expect("Error setting Ctrl-C handler");
+        }
+
+        let mut reconnect_backoff = 1;
+        let max_backoff = 32;
         loop {
-            let done = self.do_work()?;
-            if done == 0 {
-                self.sleep()?;
+            if self.should_shutdown.load(Ordering::SeqCst) {
+                eprintln!("[gearman-worker] Shutdown flag set. Exiting main loop.");
+                break;
+            }
+            let result = self.do_work();
+            match result {
+                Ok(done) => {
+                    reconnect_backoff = 1; // reset backoff on success
+                    if done == 0 {
+                        if let Err(e) = self.sleep() {
+                            eprintln!("[gearman-worker] Error during sleep: {}. Will attempt to reconnect...", e);
+                            self.reconnect_and_reregister()?;
+                            thread::sleep(Duration::from_secs(reconnect_backoff));
+                            reconnect_backoff = (reconnect_backoff * 2).min(max_backoff);
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[gearman-worker] Error in do_work: {}. Will attempt to reconnect...", e);
+                    self.reconnect_and_reregister()?;
+                    thread::sleep(Duration::from_secs(reconnect_backoff));
+                    reconnect_backoff = (reconnect_backoff * 2).min(max_backoff);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Attempt to reconnect to the server and re-register all functions
+    fn reconnect_and_reregister(&mut self) -> io::Result<()> {
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            eprintln!("[gearman-worker] Attempting to reconnect to server (attempt {})...", attempts);
+            match self.server.connect() {
+                Ok(_) => {
+                    eprintln!("[gearman-worker] Reconnected to server.");
+                    // Re-register all functions
+                    for (name, func) in self.functions.iter() {
+                        if func.enabled {
+                            if let Err(e) = self.server.send(CAN_DO, name.as_bytes()) {
+                                eprintln!("[gearman-worker] Failed to re-register function '{}': {}", name, e);
+                            }
+                        }
+                    }
+                    return Ok(());
+                }
+                Err(e) => {
+                    eprintln!("[gearman-worker] Reconnect failed: {}. Retrying in 2 seconds...", e);
+                    thread::sleep(Duration::from_secs(2));
+                }
             }
         }
     }
@@ -421,6 +503,7 @@ impl WorkerBuilder {
             id: self.id.clone(),
             server: ServerConnection::new(self.addr),
             functions: HashMap::new(),
+            should_shutdown: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -438,67 +521,84 @@ impl Default for WorkerBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::BufReader;
-    use std::process::{Child, Command, Stdio};
+    use std::env;
+    use std::process::Command;
     use std::thread;
-    use std::time;
+    use std::time::{Duration, Instant};
 
-    fn run_gearmand() -> Child {
-        let mut gearmand = Command::new("gearmand")
-            .arg("-L")
-            .arg("127.0.0.1")
-            .arg("-p")
-            .arg("14730")
-            .arg("-l")
-            .arg("stderr")
-            .arg("--verbose")
-            .arg("INFO")
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("Failed to stard gearmand");
-
-        let gearmand_err = gearmand
-            .stderr
-            .take()
-            .expect("Failed to capture gearmand's stderr");
-        let mut reader = BufReader::new(gearmand_err);
-        loop {
-            let mut line = String::new();
-            let len = reader.read_line(&mut line).unwrap();
-            if len == 0 || line.contains("Listening on 127.0.0.1:14730") {
-                break;
-            }
-        }
-
-        gearmand
+    fn get_test_port() -> u16 {
+        env::var("GEARMAN_TEST_PORT")
+            .unwrap_or_else(|_| "4730".to_string())
+            .parse()
+            .expect("Invalid GEARMAN_TEST_PORT")
     }
 
-    fn submit_job(func: &str) -> Child {
-        let gearman_cli = Command::new("gearman")
-            .arg("-Is")
-            .arg("-p")
-            .arg("14730")
-            .arg("-f")
-            .arg(func)
-            .stdout(Stdio::piped())
-            .spawn()
-            .expect("Failed to submit gearman job");
+    fn submit_job_async(func: &str, port: u16, input: &str) -> Result<String, String> {
+        
+        let container_name = env::var("GEARMAN_CONTAINER_NAME").unwrap_or_else(|_| "gearman-test-server".to_string());
+        
+        if env::var("GEARMAN_USE_CONTAINER").is_ok() {
+            // Use gearman client inside the container with echo piping approach
+            println!("Submitting job to container: func={}, input='{}'", func, input);
+            let output = Command::new("podman")
+                .arg("exec")
+                .arg(&container_name)
+                .arg("bash")
+                .arg("-c")
+                .arg(&format!("echo -n '{}' | timeout 10 gearman -p {} -f {}", 
+                    input.replace("'", "'\"'\"'"), // Escape single quotes properly
+                    port, 
+                    func))
+                .output()
+                .map_err(|e| format!("Failed to spawn container command: {}", e))?;
+            
+            if output.status.success() {
+                Ok(String::from_utf8_lossy(&output.stdout).to_string())
+            } else {
+                Err(String::from_utf8_lossy(&output.stderr).to_string())
+            }
+        } else {
+            // Use local gearman client with echo piping approach
+            let output = Command::new("bash")
+                .arg("-c")
+                .arg(&format!("echo -n '{}' | timeout 10 gearman -p {} -f {}", 
+                    input.replace("'", "'\"'\"'"), // Escape single quotes properly
+                    port, 
+                    func))
+                .output()
+                .map_err(|e| format!("Failed to spawn local command: {}", e))?;
+            
+            if output.status.success() {
+                Ok(String::from_utf8_lossy(&output.stdout).to_string())
+            } else {
+                Err(String::from_utf8_lossy(&output.stderr).to_string())
+            }
+        }
+    }
 
-        let wait = time::Duration::from_millis(250);
-        thread::sleep(wait);
-
-        gearman_cli
+    fn wait_for_server(port: u16) -> Result<(), Box<dyn std::error::Error>> {
+        let max_attempts = 30;
+        for _ in 0..max_attempts {
+            if std::net::TcpStream::connect(format!("127.0.0.1:{}", port)).is_ok() {
+                return Ok(());
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        Err("Gearman server not available".into())
     }
 
     #[test]
-    fn it_works() {
-        let mut gearmand = run_gearmand();
+    fn test_basic_job_processing() {
+        let port = get_test_port();
+        
+        // Wait for server to be available
+        wait_for_server(port).expect("Gearman server should be available");
 
-        let addr = "127.0.0.1:14730".parse().unwrap();
+        let addr = format!("127.0.0.1:{}", port).parse().unwrap();
 
         let mut worker = WorkerBuilder::default()
             .addr(addr)
-            .id("gearman-worker-rs-1")
+            .id("gearman-worker-rs-test")
             .build();
 
         worker
@@ -506,28 +606,173 @@ mod tests {
             .expect("Failed to connect to gearmand server");
 
         worker
-            .register_function("testfun", |_| {
-                println!("testfun called");
+            .register_function("testfun", |input| {
+                println!("testfun called with input: {:?}", String::from_utf8_lossy(input));
                 Ok(b"foobar".to_vec())
             })
             .expect("Failed to register test function");
 
-        // worker.set_function_enabled("testfun", false).unwrap();
+        // Give the worker time to register the function
+        thread::sleep(Duration::from_millis(500));
 
-        // worker.unregister_function("testfun").unwrap();
+        // Submit job in background thread
+        let port_clone = port;
+        let job_handle = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100)); // Let worker start first
+            submit_job_async("testfun", port_clone, "test_input_data")
+        });
 
-        // worker.set_function_enabled("testfun", true).unwrap();
-
-        let gearman_cli = submit_job("testfun");
-
-        let done = worker.do_work().unwrap();
+        // Process the job
+        let start = Instant::now();
+        let mut done = 0;
+        while done == 0 && start.elapsed() < Duration::from_secs(5) {
+            done = worker.do_work().unwrap();
+            if done == 0 {
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+        
         assert_eq!(1, done);
 
-        let output = gearman_cli
-            .wait_with_output()
-            .expect("Failed to retrieve job output");
-        assert_eq!(b"foobar", output.stdout.as_slice());
+        // Get the result
+        let result = job_handle.join().unwrap();
+        match result {
+            Ok(output) => {
+                println!("Basic test output: '{}'", output.trim());
+                assert_eq!("foobar", output.trim());
+            }
+            Err(e) => panic!("Job failed: {}", e),
+        }
+    }
 
-        gearmand.kill().expect("Failed to kill gearmand");
+    #[test]
+    fn test_error_handling() {
+        let port = get_test_port();
+        
+        // Wait for server to be available
+        wait_for_server(port).expect("Gearman server should be available");
+
+        let addr = format!("127.0.0.1:{}", port).parse().unwrap();
+
+        let mut worker = WorkerBuilder::default()
+            .addr(addr)
+            .id("gearman-worker-rs-error-test")
+            .build();
+
+        worker
+            .connect()
+            .expect("Failed to connect to gearmand server");
+
+        worker
+            .register_function("error_test", |_| {
+                Err(Some(b"Test error".to_vec()))
+            })
+            .expect("Failed to register error test function");
+
+        // Give the worker time to register the function
+        thread::sleep(Duration::from_millis(500));
+
+        // Submit job in background thread
+        let port_clone = port;
+        let job_handle = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100)); // Let worker start first
+            submit_job_async("error_test", port_clone, "test input")
+        });
+
+        // Process the job
+        let start = Instant::now();
+        let mut done = 0;
+        while done == 0 && start.elapsed() < Duration::from_secs(5) {
+            done = worker.do_work().unwrap();
+            if done == 0 {
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+        
+        assert_eq!(1, done);
+
+        // Get the result - should be an error
+        let result = job_handle.join().unwrap();
+        match result {
+            Ok(_) => panic!("Expected job to fail but it succeeded"),
+            Err(e) => {
+                println!("Got expected error: {}", e);
+                // This is expected for a failing job
+            }
+        }
+    }
+
+    #[test]
+    fn test_multiple_jobs() {
+        let port = get_test_port();
+        
+        // Wait for server to be available
+        wait_for_server(port).expect("Gearman server should be available");
+
+        let addr = format!("127.0.0.1:{}", port).parse().unwrap();
+
+        let mut worker = WorkerBuilder::default()
+            .addr(addr)
+            .id("gearman-worker-rs-multi-test")
+            .build();
+
+        worker
+            .connect()
+            .expect("Failed to connect to gearmand server");
+
+        worker
+            .register_function("multi_test", |input| {
+                let input_str = String::from_utf8_lossy(input);
+                println!("Worker received input: '{}'", input_str);
+                let response = format!("processed: {}", input_str);
+                println!("Worker sending response: '{}'", response);
+                Ok(response.into_bytes())
+            })
+            .expect("Failed to register multi test function");
+
+        // Give the worker time to register the function
+        thread::sleep(Duration::from_millis(500));
+        
+        // Submit jobs in background threads
+        let port_clone1 = port;
+        let port_clone2 = port;
+        
+        let job1_handle = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            submit_job_async("multi_test", port_clone1, "job1_data")
+        });
+        
+        let job2_handle = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(200));
+            submit_job_async("multi_test", port_clone2, "job2_data")
+        });
+
+        // Process both jobs
+        let start = Instant::now();
+        let mut total_done = 0;
+        while total_done < 2 && start.elapsed() < Duration::from_secs(10) {
+            let done = worker.do_work().unwrap();
+            total_done += done;
+            if done == 0 {
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+        
+        assert_eq!(2, total_done);
+
+        // Get the results
+        let result1 = job1_handle.join().unwrap();
+        let result2 = job2_handle.join().unwrap();
+        
+        match (result1, result2) {
+            (Ok(output1), Ok(output2)) => {
+                println!("Job 1 output: '{}'", output1.trim());
+                println!("Job 2 output: '{}'", output2.trim());
+                assert!(output1.trim().contains("processed: job1_data"));
+                assert!(output2.trim().contains("processed: job2_data"));
+            }
+            (Err(e1), _) => panic!("Job 1 failed: {}", e1),
+            (_, Err(e2)) => panic!("Job 2 failed: {}", e2),
+        }
     }
 }
