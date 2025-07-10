@@ -222,6 +222,11 @@ impl ServerConnection {
 
     fn connect(&mut self) -> io::Result<()> {
         let stream = TcpStream::connect(self.addr)?;
+        
+        // Set read and write timeouts to prevent indefinite blocking
+        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+        
         self.stream = Some(stream);
         Ok(())
     }
@@ -413,41 +418,102 @@ impl Worker {
 
         let mut reconnect_backoff = 1;
         let max_backoff = 32;
+        let mut consecutive_timeouts = 0;
+        let max_consecutive_timeouts = 3;
+        
         loop {
+            // Check shutdown flag at the start of each iteration
             if self.should_shutdown.load(Ordering::SeqCst) {
                 eprintln!("[gearman-worker] Shutdown flag set. Exiting main loop.");
                 break;
             }
+            
             let result = self.do_work();
             match result {
                 Ok(done) => {
                     reconnect_backoff = 1; // reset backoff on success
+                    consecutive_timeouts = 0; // reset timeout counter on success
                     if done == 0 {
-                        if let Err(e) = self.sleep() {
-                            eprintln!("[gearman-worker] Error during sleep: {}. Will attempt to reconnect...", e);
-                            self.reconnect_and_reregister()?;
-                            thread::sleep(Duration::from_secs(reconnect_backoff));
-                            reconnect_backoff = (reconnect_backoff * 2).min(max_backoff);
+                        // Check shutdown flag before sleeping
+                        if self.should_shutdown.load(Ordering::SeqCst) {
+                            eprintln!("[gearman-worker] Shutdown flag set. Exiting main loop.");
+                            break;
+                        }
+                        
+                        match self.sleep() {
+                            Ok(()) => {
+                                // Successfully slept, continue
+                            }
+                            Err(e) => {
+                                if self.is_timeout_error(&e) {
+                                    consecutive_timeouts += 1;
+                                    if consecutive_timeouts >= max_consecutive_timeouts {
+                                        eprintln!("[gearman-worker] Too many consecutive timeouts ({}). Will attempt to reconnect...", consecutive_timeouts);
+                                        self.reconnect_and_reregister()?;
+                                        thread::sleep(Duration::from_secs(reconnect_backoff));
+                                        reconnect_backoff = (reconnect_backoff * 2).min(max_backoff);
+                                        consecutive_timeouts = 0;
+                                    } else {
+                                        eprintln!("[gearman-worker] Timeout during sleep ({}). Continuing...", consecutive_timeouts);
+                                    }
+                                } else {
+                                    eprintln!("[gearman-worker] Error during sleep: {}. Will attempt to reconnect...", e);
+                                    self.reconnect_and_reregister()?;
+                                    thread::sleep(Duration::from_secs(reconnect_backoff));
+                                    reconnect_backoff = (reconnect_backoff * 2).min(max_backoff);
+                                }
+                            }
                         }
                     }
                 }
                 Err(e) => {
-                    eprintln!("[gearman-worker] Error in do_work: {}. Will attempt to reconnect...", e);
-                    self.reconnect_and_reregister()?;
-                    thread::sleep(Duration::from_secs(reconnect_backoff));
-                    reconnect_backoff = (reconnect_backoff * 2).min(max_backoff);
+                    if self.is_timeout_error(&e) {
+                        consecutive_timeouts += 1;
+                        if consecutive_timeouts >= max_consecutive_timeouts {
+                            eprintln!("[gearman-worker] Too many consecutive timeouts in do_work ({}). Will attempt to reconnect...", consecutive_timeouts);
+                            self.reconnect_and_reregister()?;
+                            thread::sleep(Duration::from_secs(reconnect_backoff));
+                            reconnect_backoff = (reconnect_backoff * 2).min(max_backoff);
+                            consecutive_timeouts = 0;
+                        } else {
+                            eprintln!("[gearman-worker] Timeout in do_work ({}). Continuing...", consecutive_timeouts);
+                        }
+                    } else {
+                        eprintln!("[gearman-worker] Error in do_work: {}. Will attempt to reconnect...", e);
+                        self.reconnect_and_reregister()?;
+                        thread::sleep(Duration::from_secs(reconnect_backoff));
+                        reconnect_backoff = (reconnect_backoff * 2).min(max_backoff);
+                    }
                 }
             }
+            
+            // Small sleep to prevent busy waiting and allow shutdown flag to be checked
+            thread::sleep(Duration::from_millis(10));
         }
         Ok(())
+    }
+
+    /// Check if an error is a timeout error
+    fn is_timeout_error(&self, error: &io::Error) -> bool {
+        error.kind() == io::ErrorKind::TimedOut ||
+        error.kind() == io::ErrorKind::WouldBlock
     }
 
     /// Attempt to reconnect to the server and re-register all functions
     fn reconnect_and_reregister(&mut self) -> io::Result<()> {
         let mut attempts = 0;
+        let max_attempts = 5;
+        
         loop {
             attempts += 1;
-            eprintln!("[gearman-worker] Attempting to reconnect to server (attempt {})...", attempts);
+            
+            // Check shutdown flag during reconnection attempts
+            if self.should_shutdown.load(Ordering::SeqCst) {
+                eprintln!("[gearman-worker] Shutdown flag set during reconnection. Aborting reconnection.");
+                return Err(io::Error::new(io::ErrorKind::Interrupted, "Shutdown requested"));
+            }
+            
+            eprintln!("[gearman-worker] Attempting to reconnect to server (attempt {}/{})...", attempts, max_attempts);
             match self.server.connect() {
                 Ok(_) => {
                     eprintln!("[gearman-worker] Reconnected to server.");
@@ -462,7 +528,12 @@ impl Worker {
                     return Ok(());
                 }
                 Err(e) => {
-                    eprintln!("[gearman-worker] Reconnect failed: {}. Retrying in 2 seconds...", e);
+                    eprintln!("[gearman-worker] Reconnect failed: {}", e);
+                    if attempts >= max_attempts {
+                        eprintln!("[gearman-worker] Max reconnection attempts reached. Giving up.");
+                        return Err(e);
+                    }
+                    eprintln!("[gearman-worker] Retrying in 2 seconds...");
                     thread::sleep(Duration::from_secs(2));
                 }
             }
