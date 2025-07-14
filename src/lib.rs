@@ -374,6 +374,12 @@ impl Worker {
         match resp.cmd {
             n if n == JOB_ASSIGN => Ok(Some(Job::from_data(&resp.data[..])?)),
             n if n == NO_JOB => Ok(None),
+            n if n == NOOP => {
+                // NOOP in response to GRAB_JOB is unusual but not harmful
+                // Treat it as "no job available" and continue
+                eprintln!("[gearman-worker] Received NOOP packet in grab_job (unusual but not harmful)");
+                Ok(None)
+            }
             n if n == ERROR => {
                 // Parse error message from packet data
                 let mut parts = resp.data.split(|c| *c == 0);
