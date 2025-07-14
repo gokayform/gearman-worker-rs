@@ -341,15 +341,27 @@ impl Worker {
         self.server.send(SET_CLIENT_ID, self.id.as_bytes())
     }
 
-    fn sleep(&mut self) -> io::Result<()> {
+    fn sleep(&mut self) -> io::Result<Option<Job>> {
         self.server.send(PRE_SLEEP, b"")?;
         let resp = self.server.read_header()?;
         match resp.cmd {
-            n if n == NOOP => Ok(()),
+            n if n == NOOP => Ok(None),
+            n if n == JOB_ASSIGN => {
+                // Server responded with a job directly, no need to sleep
+                Ok(Some(Job::from_data(&resp.data[..])?))
+            }
+            n if n == ERROR => {
+                // Parse error message from packet data
+                let mut parts = resp.data.split(|c| *c == 0);
+                let code = parts.next().map(|s| String::from_utf8_lossy(s).to_string()).unwrap_or_else(|| "<unknown>".to_string());
+                let msg = parts.next().map(|s| String::from_utf8_lossy(s).to_string()).unwrap_or_else(|| "<no message>".to_string());
+                eprintln!("[gearman-worker] Server sent ERROR packet during sleep: code='{}', message='{}'", code, msg);
+                Ok(None)
+            }
             n => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "Worker was sleeping. NOOP was expected but packet {} was received instead.",
+                    "Worker was sleeping. NOOP or JOB_ASSIGN was expected but packet {} was received instead.",
                     n
                 ),
             )),
@@ -441,7 +453,18 @@ impl Worker {
                         }
                         
                         match self.sleep() {
-                            Ok(()) => {
+                            Ok(Some(job)) => {
+                                // Got a job directly from sleep, process it
+                                match self.functions.get(&job.function) {
+                                    Some(func) if func.enabled => {
+                                        job.send_response(&mut self.server, &(func.callback)(&job.workload))?
+                                    }
+                                    // gearmand should never pass us a job which was never advertised or unregistered
+                                    Some(_) => eprintln!("Disabled job {:?}", job.function),
+                                    None => eprintln!("Unknown job {:?}", job.function),
+                                }
+                            }
+                            Ok(None) => {
                                 // Successfully slept, continue
                             }
                             Err(e) => {
@@ -845,5 +868,52 @@ mod tests {
             (Err(e1), _) => panic!("Job 1 failed: {}", e1),
             (_, Err(e2)) => panic!("Job 2 failed: {}", e2),
         }
+    }
+
+    #[test]
+    fn test_sleep_handles_job_assign() {
+        use std::net::TcpListener;
+        use std::io::Write;
+        use std::thread;
+        use std::time::Duration;
+        
+        // Test that sleep() properly handles JOB_ASSIGN packets
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        
+        // Spawn a mock server that responds with JOB_ASSIGN to PRE_SLEEP
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            
+            // Read PRE_SLEEP request
+            let mut buffer = vec![0u8; 12]; // 4 bytes magic + 4 bytes type + 4 bytes length
+            stream.read_exact(&mut buffer).unwrap();
+            
+            // Respond with JOB_ASSIGN packet
+            let response = b"test_handle\0test_function\0test_data";
+            stream.write_all(b"\0RES").unwrap(); // Magic
+            stream.write_u32::<BigEndian>(JOB_ASSIGN).unwrap(); // Type
+            stream.write_u32::<BigEndian>(response.len() as u32).unwrap(); // Length
+            stream.write_all(response).unwrap(); // Data
+        });
+        
+        // Give the server time to start
+        thread::sleep(Duration::from_millis(100));
+        
+        let mut worker = WorkerBuilder::default()
+            .addr(addr)
+            .build();
+        
+        // Connect to mock server
+        worker.connect().unwrap();
+        
+        // Call sleep() and verify it returns the job
+        let result = worker.sleep().unwrap();
+        assert!(result.is_some());
+        
+        let job = result.unwrap();
+        assert_eq!(job.handle, "test_handle");
+        assert_eq!(job.function, "test_function");
+        assert_eq!(job.workload, b"test_data");
     }
 }
