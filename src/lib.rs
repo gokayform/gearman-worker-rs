@@ -355,8 +355,12 @@ impl Worker {
                 let mut parts = resp.data.split(|c| *c == 0);
                 let code = parts.next().map(|s| String::from_utf8_lossy(s).to_string()).unwrap_or_else(|| "<unknown>".to_string());
                 let msg = parts.next().map(|s| String::from_utf8_lossy(s).to_string()).unwrap_or_else(|| "<no message>".to_string());
-                eprintln!("[gearman-worker] Server sent ERROR packet during sleep: code='{}', message='{}'", code, msg);
-                Ok(None)
+                
+                eprintln!("[gearman-worker] Server sent ERROR packet during sleep: code='{}', message='{}'. Triggering reconnection.", code, msg);
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    format!("Server error: {}", code)
+                ));
             }
             n => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -385,10 +389,12 @@ impl Worker {
                 let mut parts = resp.data.split(|c| *c == 0);
                 let code = parts.next().map(|s| String::from_utf8_lossy(s).to_string()).unwrap_or_else(|| "<unknown>".to_string());
                 let msg = parts.next().map(|s| String::from_utf8_lossy(s).to_string()).unwrap_or_else(|| "<no message>".to_string());
-                eprintln!("[gearman-worker] Server sent ERROR packet: code='{}', message='{}'", code, msg);
-                // Optionally, try to recover or reconnect here
-                // For now, just return no job
-                Ok(None)
+                
+                eprintln!("[gearman-worker] Server sent ERROR packet during grab_job: code='{}', message='{}'. Triggering reconnection.", code, msg);
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    format!("Server error: {}", code)
+                ));
             },
             n => {
                 eprintln!("[gearman-worker] Unexpected packet {} received in grab_job. Data: {:?}", n, resp.data);
@@ -485,6 +491,12 @@ impl Worker {
                                     } else {
                                         eprintln!("[gearman-worker] Timeout during sleep ({}). Continuing...", consecutive_timeouts);
                                     }
+                                } else if e.kind() == io::ErrorKind::ConnectionAborted {
+                                    eprintln!("[gearman-worker] Connection lost during sleep. Will attempt to reconnect...");
+                                    self.reconnect_and_reregister()?;
+                                    thread::sleep(Duration::from_secs(reconnect_backoff));
+                                    reconnect_backoff = (reconnect_backoff * 2).min(max_backoff);
+                                    consecutive_timeouts = 0;
                                 } else {
                                     eprintln!("[gearman-worker] Error during sleep: {}. Will attempt to reconnect...", e);
                                     self.reconnect_and_reregister()?;
@@ -507,6 +519,12 @@ impl Worker {
                         } else {
                             eprintln!("[gearman-worker] Timeout in do_work ({}). Continuing...", consecutive_timeouts);
                         }
+                    } else if e.kind() == io::ErrorKind::ConnectionAborted {
+                        eprintln!("[gearman-worker] Connection lost in do_work. Will attempt to reconnect...");
+                        self.reconnect_and_reregister()?;
+                        thread::sleep(Duration::from_secs(reconnect_backoff));
+                        reconnect_backoff = (reconnect_backoff * 2).min(max_backoff);
+                        consecutive_timeouts = 0;
                     } else {
                         eprintln!("[gearman-worker] Error in do_work: {}. Will attempt to reconnect...", e);
                         self.reconnect_and_reregister()?;
